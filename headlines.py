@@ -1,124 +1,128 @@
 import struct
-from pathlib import Path
+import os
+import json
 from dataclasses import dataclass
-from typing import List, Optional, BinaryIO
-
-#from keys import PageItemId
-
+from pathlib import Path
+from typing import List, Optional, Tuple, Union, Dict
 
 @dataclass
-class FileHeader:
+class HeadlineHeader:
     magic1: int
     magic2: int
-    length: int
-    rec_offset: int
-    words_offset: int
-    rec_bytes: int
+    entry_count: int
+    records_offset: int
+    strings_offset: int
+    record_stride: int
     magic4: int
     magic5: int
 
     @classmethod
-    def from_file(cls, f: BinaryIO) -> 'FileHeader':
-        data = f.read(32)
+    def from_bytes(cls, data: bytes) -> 'HeadlineHeader':
         if len(data) < 32:
-            raise Error("File too short")
-        unpacked = struct.unpack('<IIIIIIII', data)
+            raise ValueError("File too short for header")
+        unpacked = struct.unpack('<8I', data[:32])
         return cls(*unpacked)
 
-    def validate(self):
-        if (
-            self.magic1 == 0 and
-            self.magic2 == 0x2 and
-            self.rec_bytes == 0x18 and
-            self.magic4 == 0 and
-            self.magic5 == 0
-        ):
-            return
-        raise Exception("KeyFile header is invalid.")
-
-
-@dataclass
-class Offset:
-    page_id: int
-    item_id: int
-    item_type: int
-    offset: int
-
-    @classmethod
-    def from_bytes(cls, data: bytes) -> 'Offset':
-        if len(data) != 24:
-            raise Exception("Invalid offset entry size")
-        page_id, item_id, item_type, magic1, offset, magic2, magic3, magic4 = struct.unpack('<IBBHIIII', data)
-        if magic1 != 0 or magic2 != 0 or magic3 != 0 or magic4 != 0:
-            pass
-        return cls(page_id, item_id, item_type, offset)
-
-
 class Headlines:
-    def __init__(self, recs: List[Offset], words: bytes):
-        self.recs = recs
-        self.words = words
-
-    @classmethod
-    def from_path(cls, file_path: str) -> 'Headlines':
-        with open(file_path, 'rb') as f:
-            f.seek(0)
-            hdr = FileHeader.from_file(f)
-            hdr.validate()
-
-            # Read record offsets
-            rec_size = hdr.words_offset - hdr.rec_offset
-            f.seek(hdr.rec_offset)
-            rec_data = f.read(rec_size)
-            if len(rec_data) != rec_size:
-                raise Exception("Failed to read offsets")
-
-            recs = []
-            for i in range(0, rec_size, 24):
-                recs.append(Offset.from_bytes(rec_data[i:i + 24]))
-
-            # Read words data
-            f.seek(hdr.words_offset)
-            words_data = f.read()
-            if not words_data:
-                raise Exception("No words section")
-            return cls(recs, words_data)
+    def __init__(self, path: Union[str, Path]):
+        self.path = Path(path)
+        with open(self.path, 'rb') as f:
+            self.data = f.read()
+            
+        self.header = HeadlineHeader.from_bytes(self.data)
         
-    def get_word(self, rec:Offset) -> Optional[str]:
-        offset = rec.offset
-        # Read null-terminated string from words section
-        end = self.words.find(b'\0\0', offset)
-        if end == -1:
-            raise Exception("No null terminator")
-        if end % 2 == 1:
-            end += 1
-        return self.words[offset:end].decode('utf-16')
+        self.entry_count = self.header.entry_count
+        self.stride = self.header.record_stride if self.header.record_stride != 0 else 24
+        self.records_base = self.header.records_offset
+        self.strings_base = self.header.strings_offset
+        
+        # Performance optimization: cache for decoded strings
+        self._str_cache: Dict[int, str] = {0: ""}
 
-    def get(self, id) -> str:
-        # Binary search
-        low, high = 0, len(self.recs) - 1
-        while low <= high:
-            mid = (low + high) // 2
-            rec = self.recs[mid]
-            if rec.page_id == id.page and rec.item_id == id.item:
-                return self.get_word(rec)
-            elif (rec.page_id, rec.item_id) < (id.page, id.item):
-                low = mid + 1
-            else:
-                high = mid - 1
-        raise Exception("InvalidIndex")
+    def _get_string(self, offset: int) -> str:
+        if offset in self._str_cache:
+            return self._str_cache[offset]
+        
+        abs_off = self.strings_base + offset
+        if abs_off >= len(self.data):
+             return ""
+            
+        # Use fast find for null terminator
+        curr = abs_off
+        null_pos = -1
+        while True:
+            # Search for \x00\x00 (UTF-16LE null)
+            p = self.data.find(b'\x00\x00', curr)
+            if p == -1:
+                break
+                
+            # Alignment check: must be at an even offset from the string start
+            if (p - abs_off) % 2 == 0:
+                null_pos = p
+                break
+            curr = p + 1
+            
+        if null_pos == -1:
+            res = self.data[abs_off:].decode('utf-16le', errors='replace')
+        else:
+            res = self.data[abs_off:null_pos].decode('utf-16le', errors='replace')
+            
+        self._str_cache[offset] = res
+        return res
+
+    def get_by_index(self, index: int) -> Tuple[int, int, str]:
+        if index >= self.entry_count:
+            raise IndexError()
+            
+        rec_off = self.records_base + index * self.stride
+        
+        # Use unpack_from to avoid slicing the buffer
+        # Structure: page_id(4), item_id(2), magic(2), prefixOff(4), headlineOff(4), suffixOff(4), magic(4)
+        page_id, item_id, _, prefix_off, headline_off, suffix_off, _ = struct.unpack_from('<IHHIIII', self.data, rec_off)
+        
+        prefix = self._get_string(prefix_off)
+        headline = self._get_string(headline_off)
+        suffix = self._get_string(suffix_off)
+        
+        return page_id, item_id, prefix + headline + suffix
+
+    def __len__(self):
+        return self.entry_count
+
+    def __iter__(self):
+        # We can iterate using range to call optimized get_by_index
+        for i in range(self.entry_count):
+            yield self.get_by_index(i)
 
 if __name__ == "__main__":
-    import json
+    import sys
+    import time
     
-    for file in ['headline','short-headline']:
-        headline_path = f".\\NHKACCENT2\\Contents\\NHK_ACCENT\\headline\\{file}.headlinestore"
-        headlines = Headlines.from_path(headline_path)
-        out_map = {}
-
-        for rec in headlines.recs:
-            page = f"{rec.page_id:05}{'' if rec.item_id==0 else '-' +  '{:04X}'.format(rec.item_id)}"
-            text = headlines.get_word(rec)
-            out_map[page] = text
-        with open(f"{file}_headlines.json", 'w', encoding='utf-8') as f:
-            json.dump(out_map, f, ensure_ascii=False, indent=2)
+    if len(sys.argv) < 2:
+        print("Usage: python headlines.py <path_to_headlinestore>")
+        sys.exit(1)
+        
+    path = sys.argv[1]
+    
+    start_time = time.time()
+    headlines = Headlines(path)
+    count = len(headlines)
+    print(f"File: {path}")
+    print(f"Entry Count: {count}")
+    
+    out_map = {}
+    for i in range(count):
+        page_id, item_id, text = headlines.get_by_index(i)
+        page_key = f"{page_id:05}" if item_id == 0 else f"{page_id:05}-{item_id:04x}"
+        out_map[page_key] = text
+        
+        if i % 10000 == 0 and i > 0:
+            elapsed = time.time() - start_time
+            print(f"Processed {i}/{count} entries... ({elapsed:.2f}s)")
+            
+    output_name = Path(path).stem + "_headlines.json"
+    with open(output_name, 'w', encoding='utf-8') as f:
+        json.dump(out_map, f, ensure_ascii=False, indent=2)
+        
+    total_time = time.time() - start_time
+    print(f"Done! Exported to {output_name} in {total_time:.2f} seconds.")

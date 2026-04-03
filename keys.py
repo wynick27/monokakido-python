@@ -1,241 +1,267 @@
 import struct
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, List, Tuple, Union, Iterator
-from io import BufferedReader
-from enum import Enum
 import json
 
+@dataclass
+class EntryId:
+    page: int
+    item: int
+    extra: int = 0
+    type: int = 0
+    has_type: bool = False
 
-def read_u32(f: BufferedReader) -> int:
-    return struct.unpack('<I', f.read(4))[0]
+def decode_keystore_entry(data: bytes, offset: int) -> Tuple[EntryId, int]:
+    if offset >= len(data):
+        raise ValueError("Truncated entry data")
+    
+    flags = data[offset]
+    offset += 1
+    entry = EntryId(page=0, item=0)
+    
+    # Page
+    if flags & 0x01:
+        entry.page = data[offset]
+        offset += 1
+    elif flags & 0x02:
+        entry.page = struct.unpack('>H', data[offset:offset+2])[0]
+        offset += 2
+    elif flags & 0x04:
+        # 3-byte big-endian
+        entry.page = (data[offset] << 16) | (data[offset+1] << 8) | data[offset+2]
+        offset += 3
+    
+    # Item
+    if flags & 0x10:
+        entry.item = data[offset]
+        offset += 1
+    elif flags & 0x20:
+        entry.item = struct.unpack('>H', data[offset:offset+2])[0]
+        offset += 2
+        
+    # Extra
+    if flags & 0x40:
+        entry.extra = data[offset]
+        offset += 1
+    elif flags & 0x80:
+        entry.extra = struct.unpack('>H', data[offset:offset+2])[0]
+        offset += 2
+        
+    # Type
+    if flags & 0x08:
+        entry.type = data[offset]
+        offset += 1
+        entry.has_type = True
+        
+    return entry, offset
 
-
-def read_vec(f: BufferedReader, start: int) -> Optional[List[int]]:
-    f.seek(start)
-    raw = f.read(4)
-    count = struct.unpack('<I', raw)[0]
-    expected_len = 4 * count
-    raw = f.read(4 * count)
-    if len(raw) < expected_len:
-        return None
-    return list(struct.unpack('<' +  str(count)+ 'I' , raw))
-
+def decode_entry_ids(data: bytes, wide_count: bool) -> List[EntryId]:
+    if wide_count:
+        if len(data) < 4: raise ValueError("Truncated count")
+        count = struct.unpack('<I', data[:4])[0]
+        offset = 4
+    else:
+        if len(data) < 2: raise ValueError("Truncated count")
+        count = struct.unpack('<H', data[:2])[0]
+        offset = 2
+        
+    entries = []
+    for _ in range(count):
+        entry, offset = decode_keystore_entry(data, offset)
+        entries.append(entry)
+    return entries
 
 @dataclass
-class FileHeader:
-    ver: int
-    magic1: int
-    words_offset: int
-    idx_offset: int
-    next_offset: int
-    magic5: int
-    magic6: int
-    magic7: int
-
-    @classmethod
-    def from_file(cls, f: BufferedReader) -> 'FileHeader':
-        raw = f.read(0x10)
-        ver, magic1, words_offset, idx_offset = struct.unpack('<4I', raw)
-        if ver == 0x10000 and words_offset == 0x10:
-            extra = b'\x00' * 12
-        elif ver == 0x20000 and words_offset == 0x20:
-            extra = f.read(12)
-        else:
-            raise Exception("Key header is invalid.")
-
-        next_offset, magic5, magic6 = struct.unpack('<3I', extra[:12])
-        magic7 = 0
-
-        if ver == 0x10000 and magic1 == 0 and words_offset < idx_offset:
-            return cls(ver, magic1, words_offset, idx_offset, 0, 0, 0, 0)
-        elif ver == 0x20000 and magic1 == 0 and magic5 == 0 and magic6 == 0 and words_offset < idx_offset and (next_offset == 0 or idx_offset < next_offset):
-            magic7 = 0
-            return cls(ver, magic1, words_offset, idx_offset, next_offset, magic5, magic6, magic7)
-        else:
-            raise Exception("Key header is invalid.")
-
-
-@dataclass
-class IndexHeader:
-    magic: int
-    index_a_offset: int
-    index_b_offset: int
-    index_c_offset: int
-    index_d_offset: int
-
-    @classmethod
-    def from_file(cls, f: BufferedReader) -> 'IndexHeader':
-        data = f.read(20)
-        values = list(struct.unpack('<5I', data))
-        return cls(*values)
-
-    def validate(self, idx_end: int):
-        a, b, c, d = self.index_a_offset, self.index_b_offset, self.index_c_offset, self.index_d_offset
-        def check(l, r): return l < r or r == 0
-        if self.magic == 0x04 and check(a, b) and check(b, c) and check(c, d) and check(d, idx_end):
-            return
-        raise Exception("Key index header is invalid.")
-
-
+class ConversionEntry:
+    page: int
+    item: int
 
 class Keys:
-    def __init__(self, path: Union[str, Path]):
-        with open(path, 'rb') as f:
-            file_size = Path(path).stat().st_size
-            hdr = FileHeader.from_file(f)
-
-            f.seek(hdr.words_offset)
-            word_index = read_vec(f, hdr.words_offset)
+    def __init__(self, path: Union[str, Path], dict_id: Optional[str] = None):
+        self.path = Path(path)
+        self.dict_id = dict_id
+        with open(self.path, 'rb') as f:
+            self.data = f.read()
             
-            self.offset_delta = hdr.words_offset -f.tell()
-            self.word_index = word_index
+        self._parse_header()
+        self._parse_indices()
+        self._parse_conv_table()
 
-            idx_end = hdr.next_offset if hdr.next_offset != 0 else file_size
-            self.word_data = f.read(hdr.idx_offset - f.tell())
+    def _parse_header(self):
+        if len(self.data) < 16:
+            raise Exception("File too small for header")
+        
+        self.version, self.magic1, self.words_offset, self.index_offset = struct.unpack('<4I', self.data[:16])
+        
+        if self.version not in (0x10000, 0x20000):
+            raise Exception(f"Invalid keystore version: 0x{self.version:x}")
+            
+        self.conv_table_offset = 0
+        if self.version == 0x20000:
+            if len(self.data) < 32:
+                raise Exception("File too small for V2 header")
+            self.conv_table_offset, m5, m6, m7 = struct.unpack('<4I', self.data[16:32])
 
-            f.seek(hdr.idx_offset)
-            ihdr = IndexHeader.from_file(f)
-            ihdr.validate(idx_end)
+    def _parse_indices(self):
+        idx_base = self.index_offset
+        if len(self.data) < idx_base + 20:
+            raise Exception("Index section header truncated")
+            
+        magic, oA, oB, oC, oD = struct.unpack('<5I', self.data[idx_base:idx_base+20])
+        if magic != 0x04:
+            raise Exception(f"Invalid index magic: 0x{magic:x}")
+            
+        index_end = self.conv_table_offset if self.conv_table_offset != 0 else len(self.data)
+        section_size = index_end - idx_base
+        
+        offsets = [oA, oB, oC, oD, section_size]
+        self.indices = []
+        
+        for i in range(4):
+            start = offsets[i]
+            if start == 0:
+                self.indices.append([])
+                continue
+                
+            # Find next non-zero offset
+            end = section_size
+            for j in range(i + 1, 5):
+                if offsets[j] != 0:
+                    end = offsets[j]
+                    break
+            
+            if end <= start:
+                self.indices.append([])
+                continue
+                
+            idx_data = self.data[idx_base + start : idx_base + end]
+            count = struct.unpack('<I', idx_data[:4])[0]
+            # Each index entry is 4 bytes
+            offsets_list = struct.unpack(f'<{count}I', idx_data[4:4 + count*4])
+            self.indices.append(list(offsets_list))
 
-
-            self.index_len = read_vec(f,ihdr.index_a_offset + hdr.idx_offset) if ihdr.index_a_offset else []
-            self.index_prefix = read_vec(f,ihdr.index_b_offset + hdr.idx_offset) if ihdr.index_b_offset else []
-            self.index_suffix = read_vec(f,ihdr.index_c_offset + hdr.idx_offset) if ihdr.index_c_offset else []
-            self.index_unordered = read_vec(f,ihdr.index_d_offset + hdr.idx_offset) if ihdr.index_d_offset else []
+    def _parse_conv_table(self):
+        self.conv_table = []
+        if self.conv_table_offset == 0:
+            return
+            
+        if not (self.dict_id in ("KNEJ.EJ", "KNJE.JE")):
+            return
+            
+        count = struct.unpack('<I', self.data[self.conv_table_offset : self.conv_table_offset + 4])[0]
+        entry_size = 8
+        base = self.conv_table_offset + 4
+        for i in range(count):
+            page, item, padding = struct.unpack('<IHH', self.data[base + i*entry_size : base + (i+1)*entry_size])
+            self.conv_table.append(ConversionEntry(page, item))
 
     def __len__(self):
-        return len(self.word_index)
-    
-    def __iter__(self):
-        for offset in self.word_index:
-            yield self.get_word_span(offset)
+        # Return size of the primary index (Prefix/B)
+        return len(self.indices[1])
 
-    def get_word_span(self, offset: int) -> Tuple[str, int]:
+    def get_word_entry(self, offset: int) -> Tuple[str, int, int]:
+        abs_off = self.words_offset + offset
+        pages_offset = struct.unpack('<I', self.data[abs_off : abs_off + 4])[0]
+        flags = self.data[abs_off + 4]
         
-        pages_offset = struct.unpack_from('<I', self.word_data, offset + self.offset_delta)[0]
-        word_start = offset + self.offset_delta + 5
-        word_end = self.word_data.find(b'\0',word_start)
-        word_bytes = self.word_data[word_start:word_end]
-        return word_bytes.decode('utf-8'), pages_offset
+        str_begin = abs_off + 5
+        null_pos = self.data.find(b'\0', str_begin)
+        if null_pos == -1:
+            raise Exception("Unterminated word string")
+            
+        key = self.data[str_begin:null_pos].decode('utf-8')
+        return key, pages_offset, flags
 
-    def get_page_iter(self, pages_offset: int):
-        offset = pages_offset + self.offset_delta
-        count = struct.unpack_from('<H', self.word_data, offset)[0]
-        offset += 2
-        for i in range(count):
-            kind = self.word_data[offset]
+    def get_entry_ids(self, pages_offset: int, flags: int) -> List[Tuple[int, int]]:
+        wide_count = (flags & 0x04) != 0
+        abs_off = self.words_offset + pages_offset
+        
+        # We don't know the exact end of pages data, so we decode as much as needed
+        data_to_decode = self.data[abs_off:]
+        entries = decode_entry_ids(data_to_decode, wide_count)
+        
+        result = []
+        for e in entries:
+            page, item = e.page, e.item
+            if self.conv_table and page < len(self.conv_table):
+                mapped = self.conv_table[page]
+                page, item = mapped.page, mapped.item
+            result.append((page, item))
+            
+        return result
 
-            has_item = kind >> 4
-            kind = kind & 0xf
-            if kind == 1:
-                hi = self.word_data[offset + 1]
-                offset += 2
-                page = (hi)
-                item = 0
-            elif kind == 2:
-                hi, lo = self.word_data[offset + 1:offset + 3]
-                offset += 3
-                page = (hi << 8) | lo
-                item = 0
-            elif kind == 4:
-                hi, mid, lo = self.word_data[offset + 1:offset + 4]
-                offset += 4
-                page = (hi << 16) | (mid << 8) | lo
-                item = 0
-            if has_item == 1:
-                item = self.word_data[offset]
-                offset += 1
-            elif has_item == 2:
-                item = (self.word_data[offset] << 8) + self.word_data[offset+1]
-                offset += 2
-            elif has_item != 0:
-                print('Unknown item structure')
-            yield (page, item)
-
-
-
-
-
-    def cmp_key(self, target: str, idx: int) -> int:
-        offset = self.index_prefix.get(idx)
-        raw = self.words #struct.pack('<' + 'I' * len(self.words), *self.words)
-        if offset + len(target) + 1 > len(raw):
+    def get_by_index(self, idx_type: int, index: int) -> Tuple[str, List[Tuple[int, int]]]:
+        if idx_type >= 4 or index >= len(self.indices[idx_type]):
             raise IndexError()
-        found_tail = raw[offset:]
-        found = found_tail[:len(target)]
-        if found == target.encode():
-            return 0 if found_tail[len(target)] == 0 else 1
-        return (found > target.encode()) - (found < target.encode())
+            
+        offset = self.indices[idx_type][index]
+        key, pages_off, flags = self.get_word_entry(offset)
+        return key, self.get_entry_ids(pages_off, flags)
 
-    def get_idx(self, index: List[int], idx: int) -> Tuple[str, 'PageIter']:
-        if idx >= index.len():
-            return None
-        offset = index.get(idx)
-        word, pages_offset = self.get_word_span(offset)
-        return word, self.get_page_iter(pages_offset)
-
-    def search_exact(self, target_key: str) -> Tuple[int, 'PageIter']:
-        target_key = to_katakana(target_key)
-        low = 0
-        high = self.index_prefix.len()
-
-        while low <= high:
-            mid = (low + high) // 2
-            cmp = self.cmp_key(target_key, mid)
-            if cmp < 0:
-                low = mid + 1
-            elif cmp > 0:
-                high = mid - 1
-            else:
-                return mid, self.get_idx(self.index_prefix, mid)[1]
-
-        return None
-
-def to_katakana(input_str: str) -> str:
-    diff = ord('ア') - ord('あ')
-    result = []
-    converted = False
-    for ch in input_str:
-        if 'ぁ' <= ch <= 'ん':
-            result.append(chr(ord(ch) + diff))
-            converted = True
-        else:
-            result.append(ch)
-    return ''.join(result) if converted else input_str
+    def __iter__(self):
+        # Default to Prefix index (B)
+        for i in range(len(self.indices[1])):
+            yield self.get_by_index(1, i)
 
 if __name__ == "__main__":
-
-    index_map = {}
-    index_prefix = {}
-    for name in ['numeral', 'compound','headword']:
-        keys = Keys(f'.\\NHKACCENT2\\Contents\\NHK_ACCENT\\key\\{name}.keystore')
-
-        for offset in keys.index_prefix:
-            word, page_offset = keys.get_word_span(offset)
-            pages = list(f"{page:05}{'' if item==0 else '-' +  '{:04X}'.format(item)}"
-                            for page,item in keys.get_page_iter(page_offset))
-            if word in index_prefix:
-                for page in pages:
-                    if not page in index_prefix[word]:
-                        print(f"Warning: Duplicate page '{page}' found for word '{word}' in index prefix.")
-                        index_prefix[word].append(page)
-            else:
-                index_prefix[word] = pages
+    import argparse
+    parser = argparse.ArgumentParser(description='Extract and merge Monokakido Keystore files.')
+    parser.add_argument('files', nargs='+', help='Path to .keystore files')
+    parser.add_argument('--dict-id', help='Dictionary ID (e.g. KNEJ.EJ) for conversion table')
+    parser.add_argument('--output', default='keys', help='Base name for output files (default: keys)')
+    parser.add_argument('--indices', default='1', help='Comman-separated index types to extract (0:Len, 1:Prefix, 2:Suffix, 3:Other). Default: 1')
+    
+    args = parser.parse_args()
+    
+    idx_types = [int(x.strip()) for x in args.indices.split(',')]
+    
+    forward_index = {}
+    reverse_index = {}
+    
+    for file_path in args.files:
+        print(f"Processing: {file_path}")
+        k = Keys(file_path, args.dict_id)
         
-        for word, page_offset in keys:
-            pages = list(keys.get_page_iter(page_offset))
-            for page_id, item in pages:
+        for idx_type in idx_types:
+            if idx_type >= 4:
+                print(f"Warning: Invalid index type {idx_type} in {file_path}")
+                continue
+            
+            num_entries = len(k.indices[idx_type])
+            if num_entries == 0:
+                continue
                 
-                if (page_id,item) in index_map:
-                    index_map[(page_id,item)].append(word)
-                else:
-                    index_map[(page_id,item)]=[word]
-    with open('index.json','w',encoding='utf-8') as f:
-        json.dump(index_prefix, f, ensure_ascii=False, indent=2)
-    reverse_map = {}
-    for page_id, item in sorted(index_map.keys()):
-        page = f"{page_id:05}{'' if item==0 else '-' + format(item,'04X')}"
-        reverse_map[page] = list(sorted(index_map[(page_id, item)]))
-    with open('index_reverse.json','w',encoding='utf-8') as f:
-        json.dump(reverse_map, f, ensure_ascii=False, indent=2)
+            print(f"  Index Type {idx_type}: {num_entries} entries")
+            for i in range(num_entries):
+                key, entries = k.get_by_index(idx_type, i)
+                
+                if key not in forward_index:
+                    forward_index[key] = set()
+                
+                for p, it in entries:
+                    # Format entry ID as page-item (e.g., 00123-0abc)
+                    eid = f"{p:05}{'' if it == 0 else '-' + '{:04X}'.format(it)}"
+                    forward_index[key].add(eid)
+                    
+                    if eid not in reverse_index:
+                        reverse_index[eid] = set()
+                    reverse_index[eid].add(key)
+    
+    # Convert sets to sorted lists for JSON serialization
+    print("Formatting output...")
+    final_forward = {k: sorted(list(v)) for k, v in sorted(forward_index.items())}
+    final_reverse = {k: sorted(list(v)) for k, v in sorted(reverse_index.items())}
+    
+    fwd_path = f"{args.output}_forward.json"
+    rev_path = f"{args.output}_reverse.json"
+    
+    with open(fwd_path, 'w', encoding='utf-8') as f:
+        json.dump(final_forward, f, ensure_ascii=False, indent=2)
+    with open(rev_path, 'w', encoding='utf-8') as f:
+        json.dump(final_reverse, f, ensure_ascii=False, indent=2)
+        
+    print(f"Success!")
+    print(f"  Forward Index: {len(final_forward)} keys -> {fwd_path}")
+    print(f"  Reverse Index: {len(final_reverse)} entries -> {rev_path}")

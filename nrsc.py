@@ -1,188 +1,170 @@
 import os
 import struct
 import zlib
+import argparse
+import zipfile
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
-
-
-
-class Format:
-    Uncompressed = 0
-    Zlib = 1
-
+from pathlib import Path
+from typing import List, Optional, Tuple, Union, Dict
 
 @dataclass
-class NrscIdxRecord:
-    format: int
-    fileseq: int
-    id_str_offset: int
-    file_offset: int
-    length: int
+class NamedResourceStoreIndexHeader:
+    magic: int
+    record_count: int
 
-    @staticmethod
-    def from_bytes(data: bytes) -> 'NrscIdxRecord':
-        fmt, fileseq, id_str_offset, file_offset, length = struct.unpack('<HHIII', data)
-        return NrscIdxRecord(fmt, fileseq, id_str_offset, file_offset, length)
-
-    def format_type(self) -> int:
-        if self.format == Format.Uncompressed:
-            return Format.Uncompressed
-        elif self.format == Format.Zlib:
-            return Format.Zlib
-        else:
-            raise Exception("Invalid format")
-
-    def fileseq_index(self) -> int:
-        return self.fileseq
-
-    def file_offset_u64(self) -> int:
-        return self.file_offset
-
-    def len_usize(self) -> int:
-        return self.length
-
-
-class NrscIndex:
-    def __init__(self, idx: List[NrscIdxRecord], ids: str):
-        self.idx = idx
-        self.ids = ids
-
-    @staticmethod
-    def new(path: str) -> 'NrscIndex':
-        idx_path = os.path.join(path, "index.nidx")
-        with open(idx_path, "rb") as f:
-            header = f.read(8)
-            length = struct.unpack('<I', header[4:8])[0]
-            idx_size = length * 16  # 16 bytes per record
-            idx_data = f.read(idx_size)
-
-            idx = [NrscIdxRecord.from_bytes(idx_data[i:i + 16])
-                    for i in range(0, idx_size, 16)]
-
-            ids = f.read().decode("utf-8", errors="replace")
-            return NrscIndex(idx, ids)
-
-    def _string_data_offset(self):
-        return len(self.idx) * 16 + 8
-
-    def get_id_at(self, offset: int) -> str:
-        base = self._string_data_offset()
-        relative = offset - base
-        if relative > 0 and self.ids[relative - 1] != '\0':
-            raise IndexError()
-        try:
-            end = self.ids.index('\0', relative)
-            return self.ids[relative:end]
-        except ValueError:
-            raise IndexError()
-
-    def get_by_id(self, id_: str) -> NrscIdxRecord:
-        for rec in self.idx:
-            try:
-                if self.get_id_at(rec.id_str_offset) == id_:
-                    return rec
-            except IndexError:
-                continue
-        return None
-
-    def get_by_idx(self, idx: int) -> Tuple[str, NrscIdxRecord]:
-        rec = self.idx[idx]
-        id_str = self.get_id_at(rec.id_str_offset)
-        return id_str, rec
-
+    @classmethod
+    def from_bytes(cls, data: bytes) -> 'NamedResourceStoreIndexHeader':
+        if len(data) < 8:
+            raise ValueError("Size of index header must be at least 8 bytes")
+        magic, count = struct.unpack('<II', data[:8])
+        return cls(magic, count)
 
 @dataclass
-class ResourceFile:
-    seqnum: int
-    len: int
-    offset: int
-    file: object
+class NamedResourceStoreIndexRecord:
+    format_type: int    # 0 = uncompressed, 1 = zlib
+    file_sequence: int  # {seq}.nrsc
+    id_offset: int      # absolute offset from start of .nidx
+    file_offset: int    # offset within {seq}.nrsc
+    length: int         # length of (possibly compressed) data
 
+    @classmethod
+    def from_bytes(cls, data: bytes) -> 'NamedResourceStoreIndexRecord':
+        if len(data) < 16:
+            raise ValueError("Size of index record must be 16 bytes")
+        fmt, seq, id_off, f_off, length = struct.unpack('<HHIII', data[:16])
+        return cls(fmt, seq, id_off, f_off, length)
 
-class NrscData:
-    def __init__(self, files: List[ResourceFile]):
-        self.files = files
-        self.read_buf = bytearray()
-        self.decomp_buf = bytearray()
+class NamedResourceStore:
+    def __init__(self, directory: Union[str, Path]):
+        self.directory = Path(directory)
+        if not self.directory.is_directory():
+            raise FileNotFoundError(f"NRSC directory not found: {directory}")
+            
+        self._load_index()
+        self._discover_data_files()
 
-    def get_by_nidx_rec(self, rec: NrscIdxRecord) -> bytes:
-        file = self.files[rec.fileseq_index()]
-        file.file.seek(rec.file_offset_u64())
-        length = rec.len_usize()
+    def _load_index(self):
+        # find .nidx file
+        nidx_files = list(self.directory.glob("*.nidx"))
+        if not nidx_files:
+            raise FileNotFoundError(f"No .nidx file found in {self.directory}")
+        if len(nidx_files) > 1:
+             print(f"Warning: Multiple .nidx files found. Using {nidx_files[0]}")
+             
+        self.nidx_path = nidx_files[0]
+        with open(self.nidx_path, 'rb') as f:
+            header_data = f.read(8)
+            self.header = NamedResourceStoreIndexHeader.from_bytes(header_data)
+            
+            # Read records
+            self.records = []
+            for _ in range(self.header.record_count):
+                record_data = f.read(16)
+                self.records.append(NamedResourceStoreIndexRecord.from_bytes(record_data))
+            
+            # Read strings section
+            self.strings_base = 8 + self.header.record_count * 16
+            self.id_strings = f.read()
 
-        if len(self.read_buf) < length:
-            self.read_buf = bytearray(length)
-        file.file.readinto(self.read_buf)
-
-        if rec.format_type() == Format.Uncompressed:
-            return bytes(self.read_buf)
-        elif rec.format_type() == Format.Zlib:
-            decompressed = zlib.decompress(bytes(self.read_buf))
-            return decompressed
-
-
-class Nrsc:
-    def __init__(self, index: NrscIndex, data: NrscData):
-        self.index = index
-        self.data = data
-
-    @staticmethod
-    def parse_fname(fname: str) -> Optional[int]:
-        if fname.endswith(".nrsc"):
+    def _discover_data_files(self):
+        self.data_files: Dict[int, Path] = {}
+        for f in self.directory.glob("*.nrsc"):
             try:
-                return int(fname[:-5])
+                seq = int(f.stem)
+                self.data_files[seq] = f
             except ValueError:
-                return None
-        return None
+                continue
+                
+    def get_id_at(self, offset: int) -> str:
+        # id_offset in record is absolute, including the 8B header and 16B*count records
+        rel_off = offset - self.strings_base
+        if rel_off < 0 or rel_off >= len(self.id_strings):
+             return f"unknown_{offset:x}"
+            
+        # Find null terminator
+        null_pos = self.id_strings.find(b'\0', rel_off)
+        if null_pos == -1:
+            return self.id_strings[rel_off:].decode('utf-8', errors='replace')
+        return self.id_strings[rel_off:null_pos].decode('utf-8', errors='replace')
 
-    @staticmethod
-    def files(path: str) -> List[ResourceFile]:
-        entries = os.listdir(path)
-        files = []
-        for fname in entries:
-            full_path = os.path.join(path, fname)
-            seqnum = Nrsc.parse_fname(fname)
-            if seqnum is not None:
-                files.append(ResourceFile(
-                    seqnum=seqnum,
-                    len=os.path.getsize(full_path),
-                    offset=0,
-                    file=open(full_path, "rb")
-                ))
-        files.sort(key=lambda x: x.seqnum)
-        for i, f in enumerate(files):
-            if f.seqnum != i:
-                raise Exception(f"File sequence number mismatch: expected {i}, got {f.seqnum}")
-            f.offset = sum(fi.len for fi in files[:i])
-        return files
+    def get_data(self, record: NamedResourceStoreIndexRecord) -> bytes:
+        if record.file_sequence not in self.data_files:
+            raise FileNotFoundError(f"Data file {record.file_sequence}.nrsc not found")
+            
+        path = self.data_files[record.file_sequence]
+        with open(path, 'rb') as f:
+            f.seek(record.file_offset)
+            data = f.read(record.length)
+            
+        if record.format_type == 1: # Zlib
+            return zlib.decompress(data)
+        return data
 
-    @staticmethod
-    def new(path: str) -> 'Nrsc':
-        files = Nrsc.files(path)
-        index = NrscIndex.new(path)
-        return Nrsc(index, NrscData(files))
+    def __len__(self):
+        return len(self.records)
 
-    def get_by_idx(self, idx: int) -> Tuple[str, bytes]:
-        id_str, rec = self.index.get_by_idx(idx)
-        data = self.data.get_by_nidx_rec(rec)
-        return id_str, data
-
-    def get(self, id_: str) -> bytes:
-        rec = self.index.get_by_id(id_)
-        return self.data.get_by_nidx_rec(rec)
-
-    def len(self) -> int:
-        return len(self.index.idx)
-    
+    def entries(self) -> List[Tuple[str, NamedResourceStoreIndexRecord]]:
+        return [(self.get_id_at(r.id_offset), r) for r in self.records]
 
 if __name__ == "__main__":
-    import zipfile
-    nrsc = Nrsc.new(".\\NHKACCENT2\\Contents\\NHK_ACCENT\\audio")
-    print(f"Resource count: {nrsc.len()}")
-    with zipfile.ZipFile('audio_data.zip', 'w') as zf:
-        for i in range(nrsc.len()):
-            
-            id_, data = nrsc.get_by_idx(i)
-            path = f"{id_}.aac"
-            zf.writestr(path, data)
-        print("ZIP 包已生成")
+    parser = argparse.ArgumentParser(description='Extract Monokakido Named Resource Store (.nrsc)')
+    parser.add_argument('directory', help='Directory containing .nidx and .nrsc files')
+    parser.add_argument('--list', action='store_true', help='List all resources')
+    parser.add_argument('--output', '-o', help='Output directory or ZIP filename (if ends with .zip)')
+    parser.add_argument('--ext', default='', help='Force extension for extracted files (e.g., .aac or .png)')
+    
+    args = parser.parse_args()
+    
+    try:
+        nrsc = NamedResourceStore(args.directory)
+    except Exception as e:
+        print(f"Error loading NRSC: {e}")
+        exit(1)
+        
+    print(f"Directory: {args.directory}")
+    print(f"Resource count: {len(nrsc)}")
+    
+    if args.list:
+        print("\n%-40s %-10s %-10s %-6s" % ("ID", "FileSeq", "Length", "Format"))
+        print("-" * 70)
+        for name, r in nrsc.entries():
+            fmt = "Zlib" if r.format_type == 1 else "Raw"
+            print("%-40s %-10d %-10d %-6s" % (name, r.file_sequence, r.length, fmt))
+        exit(0)
+        
+    if args.output:
+        is_zip = args.output.lower().endswith('.zip')
+        ext = args.ext if args.ext.startswith('.') or not args.ext else ('.' + args.ext)
+        
+        if is_zip:
+            print(f"Extracting to ZIP: {args.output}")
+            with zipfile.ZipFile(args.output, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+                for i, (name, r) in enumerate(nrsc.entries()):
+                    try:
+                        data = nrsc.get_data(r)
+                        fname = f"{name}{ext}" if not name.lower().endswith(ext.lower()) else name
+                        zf.writestr(fname, data)
+                        if (i + 1) % 100 == 0:
+                            print(f"  Processed {i+1}/{len(nrsc)}...")
+                    except Exception as e:
+                        print(f"  Error extracting {name}: {e}")
+        else:
+            print(f"Extracting to directory: {args.output}")
+            os.makedirs(args.output, exist_ok=True)
+            for i, (name, r) in enumerate(nrsc.entries()):
+                try:
+                    data = nrsc.get_data(r)
+                    fname = f"{name}{ext}" if not name.lower().endswith(ext.lower()) else name
+                    out_path = Path(args.output) / fname
+                    # Support folder structure in IDs if any
+                    out_path.parent.makedirs(exist_ok=True)
+                    with open(out_path, 'wb') as f:
+                        f.write(data)
+                    if (i + 1) % 100 == 0:
+                        print(f"  Processed {i+1}/{len(nrsc)}...")
+                except Exception as e:
+                     print(f"  Error extracting {name}: {e}")
+                     
+        print("\nExtraction complete!")
+    else:
+        print("\nUse --list to see items or --output <dir|zip> to extract.")
