@@ -37,7 +37,7 @@ class NamedResourceStoreIndexRecord:
 class NamedResourceStore:
     def __init__(self, directory: Union[str, Path]):
         self.directory = Path(directory)
-        if not self.directory.is_directory():
+        if not self.directory.is_dir():
             raise FileNotFoundError(f"NRSC directory not found: {directory}")
             
         self._load_index()
@@ -157,7 +157,7 @@ if __name__ == "__main__":
                     fname = f"{name}{ext}" if not name.lower().endswith(ext.lower()) else name
                     out_path = Path(args.output) / fname
                     # Support folder structure in IDs if any
-                    out_path.parent.makedirs(exist_ok=True)
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
                     with open(out_path, 'wb') as f:
                         f.write(data)
                     if (i + 1) % 100 == 0:

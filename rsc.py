@@ -102,10 +102,7 @@ class RscIndex:
 
     def get_by_idx(self, idx: int) -> Tuple[int, MapRecord]:
         if self.idx:
-            rec = self.idx[idx]
-            if not rec or rec.map_idx != idx:
-                return None
-            item_id = rec.item_id
+            item_id = self.idx[idx].item_id
         else:
             item_id = idx
 
@@ -299,12 +296,13 @@ class Rsc:
             self.load_contents(rec.zoffset)
         ioffset = rec.ioffset
         if ioffset + 4 > self.current_len:
-            raise IndexError()
+            # Zero-length entry located at the very end of a chunk.
+            return b""
         
         marker = struct.unpack('<I', self.contents_buf[ioffset:ioffset+4])[0]
         if marker == 0:
             if ioffset + 8 > self.current_len:
-                raise IndexError()
+                return b""
             length = struct.unpack('<I', self.contents_buf[ioffset+4:ioffset+8])[0]
             return self.contents_buf[ioffset+8:ioffset+8+length]
         else:
@@ -336,7 +334,6 @@ def file_offset(files: List[ResourceFile], offset: int) -> Tuple[object, int]:
 
 if __name__ == "__main__":
     import sys
-    sys.argv = ["","contents","contents","KJCL.J"]
     if len(sys.argv) < 3:
         print("Usage: python rsc.py <path_to_contents_dir> <rsc_name> [dict_id]")
         sys.exit(1)

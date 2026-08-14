@@ -177,9 +177,21 @@ class Keys:
     def get_entry_ids(self, pages_offset: int, flags: int) -> List[Tuple[int, int]]:
         wide_count = (flags & 0x04) != 0
         abs_off = self.words_offset + pages_offset
-        
-        # We don't know the exact end of pages data, so we decode as much as needed
-        data_to_decode = self.data[abs_off:]
+
+        # Read only the count header to determine how many entries must be decoded,
+        # then slice a small bounded window instead of copying the rest of the file.
+        count_size = 4 if wide_count else 2
+        if abs_off + count_size > len(self.data):
+            raise ValueError("Truncated pages data")
+        count = (
+            struct.unpack('<I', self.data[abs_off:abs_off + 4])[0]
+            if wide_count
+            else struct.unpack('<H', self.data[abs_off:abs_off + 2])[0]
+        )
+        # A single keystore entry is at most 9 bytes:
+        #   flags(1) + page(1..3) + item(0..2) + extra(0..2) + type(0..1)
+        need = count_size + count * 9
+        data_to_decode = self.data[abs_off:abs_off + need]
         entries = decode_entry_ids(data_to_decode, wide_count)
         
         result = []

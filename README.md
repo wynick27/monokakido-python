@@ -168,3 +168,40 @@ int index_c[count_c];
 int count_d;
 int index_d[count_d];
 ```
+
+## 一键解压全部（extract_all.py）
+
+`extract_all.py` 是主脚本，会把一个目录里所有词典产品的各部分一次性解压出来。
+
+```bash
+# 输入 E:\github\monokakido（内含多个词典产品），默认输出到 E:\github\monokakido_extracted
+python extract_all.py E:\github\monokakido
+
+# 指定输出目录
+python extract_all.py E:\github\monokakido -o D:\out
+
+# 只列出发现的词典与子词典，不解压
+python extract_all.py E:\github\monokakido --list
+```
+
+它通过每个产品 `Contents/<name>.json` 里的 `DSProductContents` 识别子词典，
+用 `DSContentIdentifier`（即 dict id，例如 `ACCESSDJ4.DEJ`、`Access.JDE`）作为解密密钥，
+用 `DSContentDirectory` 定位数据目录（并会用各目录下的 `DSContentInfo.plist` 校正过期的目录名）。
+
+输出结构（每个子词典一个文件夹）：
+
+```
+<输出目录>/
+  <产品名>/
+    <dict id>/
+      contents.json              # RSC 正文
+      headline.json              # RSC 标题（如 RUIGO）
+      <名>_headlines.json        # headlinestore 标题
+      <名>_keys_forward.json     # keystore 正查（词 → 条目）
+      <名>_keys_reverse.json     # keystore 反查（条目 → 词）
+      audio/                     # NRSC 音频
+      images/                    # NRSC 图片
+      fonts/<FontName>.ttf/.otf  # RSC 字体
+      index.json                 # RSC 索引（如 RUIGO）
+      appendix/…                 # .entries 附录
+```
